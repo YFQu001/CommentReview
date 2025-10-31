@@ -6,6 +6,7 @@ import json
 from tqdm import tqdm
 from functools import partial
 import os
+import sys
 
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
@@ -149,6 +150,12 @@ def create_prompt_completion_format(example, args):
 
 def main(args):
     """主训练和评估逻辑"""
+    global_rank = int(os.environ.get("RANK", 0))
+    is_main_process = (global_rank == 0)
+
+    if not is_main_process:
+        # 禁用所有非主进程的 print() 输出 (包括来自 prepare_datasets 的)
+        sys.stdout = open(os.devnull, 'w')
     
     # --- (可选) 确保你的 GPU 支持 bfloat16 ---
     if not torch.cuda.is_bf16_supported():
@@ -218,7 +225,6 @@ def main(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    print(tokenizer.chat_template)
 
 
 
@@ -308,7 +314,7 @@ def main(args):
     valid_labels = ["通过", "不通过", "解析失败"] 
 
     # 2. 遍历验证集
-    for index, row in tqdm(validation_df.iterrows(), total=len(validation_df), desc="验证集推理"):
+    for index, row in tqdm(validation_df.iterrows(), total=len(validation_df), desc="验证集推理", disable=not is_main_process):
         
         prompt_text = PROMPT_TEMPLATE.format(
             object_name=row[args.object_col],
