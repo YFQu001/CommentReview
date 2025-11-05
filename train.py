@@ -7,6 +7,7 @@ from tqdm import tqdm
 from functools import partial
 import os
 import sys
+from transformers import pipeline
 
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
@@ -299,48 +300,63 @@ def main(args):
     print(f"模型已保存至: {final_model_path}")
 
     # 步骤 6: 在完整的验证集上推理，并计算准确率
-    print("\n--- 开始在【完整验证集】上进行推理评估 (JSON 模式) ---")
+    print("\n--- 开始在【完整验证集】上进行推理评估 (批量模式) ---")
 
     trained_model = trainer.model 
     trained_model.eval() 
 
-    # 1. 获取原始的 Pandas DataFrame
+    # 2. 获取原始的 Pandas DataFrame 和真实标签
     validation_df = data_splits['valid_set'] 
+    ground_truths = validation_df[args.status_col].astype(str).str.strip().tolist()
     print(f"将在 {len(validation_df)} 条验证数据上运行推理...")
 
-    predictions = []
-    ground_truths = []
-    start_time = time.time()
-    valid_labels = ["通过", "不通过", "解析失败"] 
+    # 3. 初始化 text-generation pipeline
+    # (重要) pipeline 会自动处理设备、padding 和批量推理
+    pipe = pipeline(
+        "text-generation",
+        model=trained_model,
+        tokenizer=tokenizer,
+        device=trained_model.device, # 使用模型所在的设备
+        torch_dtype=TORCH_DTYPE
+    )
 
-    # 2. 遍历验证集
-    for index, row in tqdm(validation_df.iterrows(), total=len(validation_df), desc="验证集推理", disable=not is_main_process):
-        
+    # 4. (一次性) 准备所有 prompts
+    all_messages = []
+    for index, row in validation_df.iterrows():
         prompt_text = PROMPT_TEMPLATE.format(
             object_name=row[args.object_col],
             text_content=row[args.text_col]
         )
-        messages = [
-            {"role": "user", "content": prompt_text}
-        ]
+        all_messages.append([{"role": "user", "content": prompt_text}])
 
-        true_label = str(row[args.status_col]).strip()
-        ground_truths.append(true_label)
+    # 5. 定义生成参数
+    generation_kwargs = {
+        "max_new_tokens": 40,
+        "eos_token_id": tokenizer.eos_token_id,
+        "pad_token_id": tokenizer.pad_token_id,
+        "return_full_text": False, # (重要) 仅返回生成的部分
+    }
 
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            return_tensors="pt"
-        ).to(trained_model.device)
+    # 6. (核心) 运行批量推理
+    predictions = []
+    valid_labels = ["通过", "不通过", "解析失败"] 
+    batch_size = args.per_device_eval_batch_size # 使用您在参数中定义的评估 batch_size
+    
+    print(f"--- 开始批量推理 (Batch Size: {batch_size}) ---")
+    start_time = time.time()
 
-        outputs = trained_model.generate(
-            inputs, 
-            max_new_tokens=40,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id
-        )
-
-        new_tokens = outputs[0, inputs.shape[1]:] 
-        pred_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    # pipe() 会自动处理 tqdm 和批量
+    for out in tqdm(pipe(all_messages, batch_size=batch_size, **generation_kwargs), total=len(all_messages)):
+        
+        # pipeline 输出结构: [{'generated_text': '...json...'}]
+        # 因为我们设置了 return_full_text=False, 'generated_text' 只包含
+        # assistant 的回复
+        if not out or 'generated_text' not in out[0]:
+            pred_label = "解析失败"
+            predictions.append(pred_label)
+            continue
+            
+        pred_text = out[0]['generated_text']
         
         pred_label = "解析失败" # 默认值
         try:
@@ -351,6 +367,7 @@ def main(args):
                 if "result" in data:
                     pred_label = str(data["result"]).strip()
             else:
+                # 兼容解析失败但包含关键词的情况
                 if "通过" in pred_text:
                     pred_label = "通过"
                 elif "不通过" in pred_text:
@@ -361,7 +378,7 @@ def main(args):
             
         predictions.append(pred_label)
 
-    # 3. 计算并打印最终指标
+    # 7. 计算并打印最终指标 (与之前相同)
     end_time = time.time()
     print(f"\n--- 推理完成 ---")
     print(f"总耗时: {end_time - start_time:.2f} 秒")
